@@ -8,11 +8,13 @@ local M = {}
 ---@class WebSocketClient
 ---@field id string Unique client identifier
 ---@field tcp_handle table The vim.loop TCP handle
----@field state string Connection state: "connecting", "connected", "closing", "closed"
+---@field state string Connection state: "connecting", "connected", "unresponsive", "zombie", "closing", "closed"
 ---@field buffer string Incoming data buffer
 ---@field handshake_complete boolean Whether WebSocket handshake is complete
 ---@field last_ping number Timestamp of last ping sent
 ---@field last_pong number Timestamp of last pong received
+---@field auth_token string|nil Authentication token used by this client
+---@field zombie_since number|nil Timestamp when client became zombie
 
 ---@brief Create a new WebSocket client
 ---@param tcp_handle table The vim.loop TCP handle
@@ -28,6 +30,8 @@ function M.create_client(tcp_handle)
     handshake_complete = false,
     last_ping = 0,
     last_pong = vim.loop.now(),
+    auth_token = nil,
+    zombie_since = nil,
   }
 
   return client
@@ -61,6 +65,8 @@ function M.process_data(client, data, on_message, on_close, on_error, auth_token
       if success then
         if auth_token then
           logger.debug("client", "Client authenticated successfully:", client.id)
+          -- Store the auth token for potential reconnection
+          client.auth_token = auth_token
         else
           logger.debug("client", "Client handshake completed (no auth required):", client.id)
         end
@@ -97,6 +103,26 @@ function M.process_data(client, data, on_message, on_close, on_error, auth_token
           client.state = "connected"
           client.buffer = remaining
           logger.debug("client", "WebSocket connection established for client:", client.id)
+          
+          -- Check if this is a zombie reconnection
+          if client._server_ref and client.auth_token then
+            local tcp_module = require("claudecode.server.tcp")
+            local zombie = tcp_module._find_zombie_by_auth(client._server_ref, client.auth_token)
+            if zombie then
+              logger.debug("client", "Found zombie client for reconnection:", zombie.id)
+              -- Remove the new client and reuse the zombie
+              client._server_ref.clients[client.id] = nil
+              -- Reconnect the zombie with the new TCP handle
+              if M.reconnect_zombie(zombie, client.tcp_handle) then
+                logger.debug("client", "Successfully reconnected zombie client:", zombie.id)
+                -- Transfer remaining buffer to zombie and return to continue processing
+                zombie.buffer = client.buffer
+                -- Replace client reference in closure
+                client = zombie
+                on_message(zombie, "") -- Trigger reconnection notification
+              end
+            end
+          end
 
           if #client.buffer > 0 then
             M.process_data(client, "", on_message, on_close, on_error, auth_token)
@@ -253,6 +279,59 @@ function M.get_client_info(client)
     last_ping = client.last_ping,
     last_pong = client.last_pong,
   }
+end
+
+---@brief Move client to zombie state (disconnected but can reconnect)
+---@param client WebSocketClient The client object
+function M.make_zombie(client)
+  if client.state ~= "connected" and client.state ~= "unresponsive" then
+    return
+  end
+  
+  logger.debug("client", "Moving client to zombie state:", client.id)
+  client.state = "zombie"
+  client.zombie_since = vim.loop.now()
+  
+  -- Close TCP handle but keep client metadata
+  if client.tcp_handle and not client.tcp_handle:is_closing() then
+    client.tcp_handle:close()
+  end
+end
+
+---@brief Attempt to reconnect a zombie client
+---@param zombie_client WebSocketClient The zombie client
+---@param new_tcp_handle table The new TCP handle
+---@return boolean success True if reconnection successful
+function M.reconnect_zombie(zombie_client, new_tcp_handle)
+  if zombie_client.state ~= "zombie" then
+    return false
+  end
+  
+  logger.debug("client", "Reconnecting zombie client:", zombie_client.id)
+  
+  -- Update client with new connection
+  zombie_client.tcp_handle = new_tcp_handle
+  zombie_client.state = "connecting"
+  zombie_client.buffer = ""
+  zombie_client.handshake_complete = false
+  zombie_client.last_pong = vim.loop.now()
+  zombie_client.zombie_since = nil
+  
+  return true
+end
+
+---@brief Check if zombie client has expired
+---@param client WebSocketClient The client object
+---@param timeout number Timeout in milliseconds (default: 300000 = 5 minutes)
+---@return boolean expired True if zombie has expired
+function M.is_zombie_expired(client, timeout)
+  timeout = timeout or 300000 -- 5 minutes default
+  if client.state ~= "zombie" or not client.zombie_since then
+    return false
+  end
+  
+  local now = vim.loop.now()
+  return (now - client.zombie_since) > timeout
 end
 
 return M

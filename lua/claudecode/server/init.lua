@@ -95,7 +95,9 @@ function M.start(config, auth_token)
   M.state.server = server
   M.state.port = server.port
 
-  M.state.ping_timer = tcp_server.start_ping_timer(server, 30000) -- Start ping timer to keep connections alive
+  -- Start ping timer with configured interval
+  local ping_interval = config.reconnection and config.reconnection.ping_interval or 30000
+  M.state.ping_timer = tcp_server.start_ping_timer(server, ping_interval)
 
   return true, server.port
 end

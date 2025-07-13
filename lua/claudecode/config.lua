@@ -18,6 +18,14 @@ M.defaults = {
     vertical_split = true,
     open_in_current_tab = true, -- Use current tab instead of creating new tab
   },
+  -- Reconnection and zombie client settings
+  reconnection = {
+    enabled = true, -- Enable zombie clients and reconnection
+    ping_interval = 30000, -- Ping interval in milliseconds (30 seconds)
+    ping_timeout = 60000, -- Ping timeout in milliseconds (60 seconds)
+    zombie_timeout = 300000, -- How long to keep zombie clients (5 minutes)
+    sleep_grace_multiplier = 4, -- Multiplier for detecting sleep/wake (ping_interval * multiplier)
+  },
 }
 
 --- Validates the provided configuration table.
@@ -73,6 +81,26 @@ function M.validate(config)
   assert(type(config.diff_opts.show_diff_stats) == "boolean", "diff_opts.show_diff_stats must be a boolean")
   assert(type(config.diff_opts.vertical_split) == "boolean", "diff_opts.vertical_split must be a boolean")
   assert(type(config.diff_opts.open_in_current_tab) == "boolean", "diff_opts.open_in_current_tab must be a boolean")
+  
+  -- Validate reconnection settings
+  assert(type(config.reconnection) == "table", "reconnection must be a table")
+  assert(type(config.reconnection.enabled) == "boolean", "reconnection.enabled must be a boolean")
+  assert(
+    type(config.reconnection.ping_interval) == "number" and config.reconnection.ping_interval > 0,
+    "reconnection.ping_interval must be a positive number"
+  )
+  assert(
+    type(config.reconnection.ping_timeout) == "number" and config.reconnection.ping_timeout > 0,
+    "reconnection.ping_timeout must be a positive number"
+  )
+  assert(
+    type(config.reconnection.zombie_timeout) == "number" and config.reconnection.zombie_timeout > 0,
+    "reconnection.zombie_timeout must be a positive number"
+  )
+  assert(
+    type(config.reconnection.sleep_grace_multiplier) == "number" and config.reconnection.sleep_grace_multiplier > 0,
+    "reconnection.sleep_grace_multiplier must be a positive number"
+  )
 
   return true
 end

@@ -114,8 +114,14 @@ function M._handle_new_connection(server)
     return
   end
 
-  -- Create WebSocket client wrapper
+  -- Check if this might be a reconnecting zombie client
+  -- We'll determine this during handshake based on auth token
+  -- For now, create a new client
   local client = client_manager.create_client(client_tcp)
+  
+  -- Store reference to server for potential zombie lookup
+  client._server_ref = server
+  
   server.clients[client.id] = client
 
   -- Set up data handler
@@ -247,22 +253,76 @@ function M.start_ping_timer(server, interval)
 
   local timer = vim.loop.new_timer()
   timer:start(interval, interval, function()
-    for _, client in pairs(server.clients) do
+    -- Track clients to clean up (to avoid modifying table while iterating)
+    local clients_to_clean = {}
+    
+    for client_id, client in pairs(server.clients) do
       if client.state == "connected" then
+        -- Get config values
+        local config = require("claudecode.config").config
+        local reconnection_enabled = config.reconnection and config.reconnection.enabled
+        local ping_timeout = config.reconnection and config.reconnection.ping_timeout or interval * 2
+        local grace_multiplier = config.reconnection and config.reconnection.sleep_grace_multiplier or 4
+        
         -- Check if client is alive
-        if client_manager.is_client_alive(client, interval * 2) then
+        if client_manager.is_client_alive(client, ping_timeout) then
           client_manager.send_ping(client, "ping")
         else
-          -- Client appears dead, close it
-          server.on_error("Client " .. client.id .. " appears dead, closing")
-          client_manager.close_client(client, 1006, "Connection timeout")
-          M._remove_client(server, client)
+          if reconnection_enabled then
+            -- Check for possible sleep/wake event
+            local time_since_last_pong = vim.loop.now() - client.last_pong
+            if time_since_last_pong > interval * grace_multiplier then
+              -- Likely a sleep/wake event - give grace period
+              server.on_error("Client " .. client.id .. " appears unresponsive (possible sleep/wake), moving to zombie state")
+              client_manager.make_zombie(client)
+            else
+              -- Normal timeout - move to zombie state
+              server.on_error("Client " .. client.id .. " connection timeout, moving to zombie state")
+              client_manager.make_zombie(client)
+            end
+          else
+            -- Original behavior - close connection
+            server.on_error("Client " .. client.id .. " appears dead, closing")
+            client_manager.close_client(client, 1006, "Connection timeout")
+            M._remove_client(server, client)
+          end
+        end
+      elseif client.state == "zombie" then
+        -- Check if zombie has expired
+        local config = require("claudecode.config").config
+        local zombie_timeout = config.reconnection and config.reconnection.zombie_timeout or 300000
+        if client_manager.is_zombie_expired(client, zombie_timeout) then
+          server.on_error("Zombie client " .. client.id .. " expired, removing")
+          table.insert(clients_to_clean, client_id)
         end
       end
+    end
+    
+    -- Clean up expired zombies
+    for _, client_id in ipairs(clients_to_clean) do
+      server.clients[client_id] = nil
     end
   end)
 
   return timer
+end
+
+---@brief Find a zombie client by auth token
+---@param server TCPServer The server object
+---@param auth_token string The authentication token
+---@return WebSocketClient|nil client The zombie client if found
+function M._find_zombie_by_auth(server, auth_token)
+  if not auth_token then
+    return nil
+  end
+  
+  for _, client in pairs(server.clients) do
+    if client.state == "zombie" and client.auth_token == auth_token then
+      return client
+    end
+  end
+  
+  return nil
 end
 
 return M
